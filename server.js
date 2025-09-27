@@ -7,183 +7,181 @@ import traverse from "@babel/traverse";
 import generate from "@babel/generator";
 import * as t from "@babel/types";
 
-// Fix for @babel/traverse & generator ESM compatibility
 const babelTraverse = traverse.default || traverse;
 const babelGenerate = generate.default || generate;
 
 const app = express();
 
-app.use(cors({
-  origin: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
-app.use(express.json());
-
-// Path to your Next.js site root (adjust if needed)
+// 🔧 Set this to your real Next.js project root
 const SITE_ROOT = path.resolve("../ids-new");
 
-function parseId(id) {
-  // id format: relative/path/to/file.tsx:LINE:COL
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
+
+// ---------- helpers ----------
+function parseLocator(id) {
   const parts = id.split(":");
   if (parts.length < 3) throw new Error("Invalid id format");
   const col = Number(parts.pop());
   const line = Number(parts.pop());
-  const filePath = parts.join(":"); // supports colons in path
-  if (Number.isNaN(line) || Number.isNaN(col)) throw new Error("Invalid line/col in id");
+  const filePath = parts.join(":");
+  if (Number.isNaN(line) || Number.isNaN(col)) throw new Error("Invalid line/column");
   return { filePath, line, col };
 }
 
+const isValidIdentifier = (key) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key);
+
+function makeKeyNode(key) {
+  // Use identifier for camelCase like color, backgroundColor; use string literal for dash-case like "font-size"
+  return isValidIdentifier(key) ? t.identifier(key) : t.stringLiteral(key);
+}
+
+function makeValueNode(val) {
+  return typeof val === "number" ? t.numericLiteral(val) : t.stringLiteral(String(val));
+}
+
+function buildStyleObject(styles) {
+  return t.objectExpression(
+    Object.entries(styles).map(([k, v]) => t.objectProperty(makeKeyNode(k), makeValueNode(v)))
+  );
+}
+
+function upsertStyleAttr(openingEl, incomingStyles) {
+  if (!incomingStyles || typeof incomingStyles !== "object") return;
+
+  let styleAttr = openingEl.attributes.find(
+    (a) => t.isJSXAttribute(a) && t.isJSXIdentifier(a.name, { name: "style" })
+  );
+
+  if (!styleAttr) {
+    openingEl.attributes.push(
+      t.jsxAttribute(t.jsxIdentifier("style"), t.jsxExpressionContainer(buildStyleObject(incomingStyles)))
+    );
+    return;
+  }
+
+  // Merge if existing style is an object expression; otherwise replace
+  if (
+    t.isJSXAttribute(styleAttr) &&
+    t.isJSXExpressionContainer(styleAttr.value) &&
+    t.isObjectExpression(styleAttr.value.expression)
+  ) {
+    const obj = styleAttr.value.expression;
+    const existing = new Map(
+      obj.properties
+        .filter((p) => t.isObjectProperty(p))
+        .map((p) => [t.isIdentifier(p.key) ? p.key.name : p.key.value, p])
+    );
+    for (const [k, v] of Object.entries(incomingStyles)) {
+      const keyStr = k;
+      const nextProp = t.objectProperty(makeKeyNode(keyStr), makeValueNode(v));
+      if (existing.has(keyStr)) {
+        const node = existing.get(keyStr);
+        node.value = nextProp.value;
+      } else {
+        obj.properties.push(nextProp);
+      }
+    }
+  } else {
+    styleAttr.value = t.jsxExpressionContainer(buildStyleObject(incomingStyles));
+  }
+}
+
+function upsertAttributes(openingEl, attrs) {
+  if (!attrs || typeof attrs !== "object") return;
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "style") continue; // handled separately
+    const existing = openingEl.attributes.find(
+      (a) => t.isJSXAttribute(a) && t.isJSXIdentifier(a.name, { name: k })
+    );
+    const valueNode = t.stringLiteral(String(v));
+    if (existing && t.isJSXAttribute(existing)) {
+      existing.value = valueNode;
+    } else {
+      openingEl.attributes.push(t.jsxAttribute(t.jsxIdentifier(k), valueNode));
+    }
+  }
+}
+// ---------- /helpers ----------
+
 app.post("/update-element", (req, res) => {
-  const { id, newText } = req.body;
+  // Accept both old and new field names
+  const styles = req.body.newStyles ?? req.body.styles ?? null;
+  const attributes = req.body.newAttributes ?? req.body.attributes ?? null;
+  const newText = req.body.newText ?? null;
+  const id = req.body.id;
 
-  console.log("🔍 Update request received:");
-  console.log("  ID:", id);
-  console.log("  New Text:", newText);
+  console.log("📝 Save:", { id, hasText: newText != null, styles, attributes });
 
-  let parsed;
+  let locator;
   try {
-    parsed = parseId(id);
-  } catch (err) {
-    return res.status(400).json({ error: "Invalid id format", detail: String(err) });
+    locator = parseLocator(id);
+  } catch (e) {
+    return res.status(400).json({ error: "Invalid id", detail: String(e) });
+  }
+
+  const absPath = path.join(SITE_ROOT, locator.filePath);
+  if (!fs.existsSync(absPath)) {
+    return res.status(404).json({ error: `File not found: ${absPath}` });
   }
 
   try {
-    const absPath = path.join(SITE_ROOT, parsed.filePath);
-
-    console.log("📁 File path:", absPath);
-    console.log("📁 File exists:", fs.existsSync(absPath));
-
-    if (!fs.existsSync(absPath)) {
-      return res.status(404).json({ error: `File not found: ${absPath}` });
-    }
-
     const code = fs.readFileSync(absPath, "utf8");
-    console.log("📄 File content length:", code.length);
-    console.log("📄 First 200 chars:", code.substring(0, 200) + "...");
-
-    const ast = parse(code, {
-      sourceType: "module",
-      plugins: ["jsx", "typescript"],
-      // locations are on by default; keep them
-    });
-
-    console.log("🌳 AST parsed successfully");
+    const ast = parse(code, { sourceType: "module", plugins: ["jsx", "typescript"] });
 
     let updated = false;
-    let elementsFound = 0;
-    let elementsWithDataId = 0;
 
     babelTraverse(ast, {
-      JSXElement(path) {
-        elementsFound++;
-        const opening = path.node.openingElement;
+      JSXOpeningElement(path) {
+        const start = path.node.loc?.start;
+        if (!start) return;
 
-        // Count and log any data-appopen-id attributes we find (for debugging)
-        const dataIdAttr = opening.attributes.find(
-          (a) =>
-            t.isJSXAttribute(a) &&
-            t.isJSXIdentifier(a.name) &&
-            a.name.name === "data-appopen-id"
-        );
+        const lineMatch = start.line === locator.line;
+        const colMatch = start.column === locator.col || Math.abs(start.column - locator.col) === 1;
+        if (!(lineMatch && colMatch)) return;
 
-        if (dataIdAttr) {
-          elementsWithDataId++;
-          const dataIdValue = t.isStringLiteral(dataIdAttr.value) ? dataIdAttr.value.value : 'non-string';
-          console.log(`  Element ${elementsWithDataId}: data-appopen-id="${dataIdValue}"`);
-        }
+        const openingEl = path.node;
+        const parentEl = path.parentPath.node; // JSXElement
 
-        // 1) Prefer exact attribute match
-        const attrMatch = opening.attributes.find(
-          (a) =>
-            t.isJSXAttribute(a) &&
-            t.isJSXIdentifier(a.name) &&
-            a.name.name === "data-appopen-id" &&
-            t.isStringLiteral(a.value) &&
-            a.value.value === id
-        );
-
-        // 2) Fallback: match by location (line/column)
-        let locMatch = false;
-        if (!attrMatch && opening.loc && opening.loc.start) {
-          const nodeLine = opening.loc.start.line;
-          const nodeCol = opening.loc.start.column;
-          // Compare with parsed values (the loader used loc.start)
-          if (nodeLine === parsed.line && nodeCol === parsed.col) {
-            locMatch = true;
+        // Text
+        if (typeof newText === "string") {
+          const idx = parentEl.children.findIndex((c) => t.isJSXText(c));
+          if (idx >= 0 && t.isJSXText(parentEl.children[idx])) {
+            parentEl.children[idx].value = newText;
           } else {
-            // Sometimes column offsets differ (0 vs 1 based). Try relaxed check:
-            if (nodeLine === parsed.line && Math.abs(nodeCol - parsed.col) <= 1) {
-              locMatch = true;
-            }
+            parentEl.children.unshift(t.jsxText(newText));
           }
         }
 
-        if (attrMatch || locMatch) {
-          console.log("✅ Found matching element! (attrMatch:", !!attrMatch, "locMatch:", locMatch, ")");
-          // Find the first text child (JSXText) and update it, otherwise insert one
-          const textChildIndex = path.node.children.findIndex((child) => t.isJSXText(child));
-          if (textChildIndex >= 0) {
-            const textChild = path.node.children[textChildIndex];
-            if (t.isJSXText(textChild)) {
-              console.log("📝 Updating existing text child:", JSON.stringify(textChild.value).slice(0,80));
-              textChild.value = newText;
-            }
-          } else {
-            // If there are no text children, try to find a JSXExpressionContainer with string literal
-            let foundExpression = false;
-            for (let i = 0; i < path.node.children.length; i++) {
-              const ch = path.node.children[i];
-              if (t.isJSXExpressionContainer(ch) && t.isStringLiteral(ch.expression)) {
-                (ch.expression.value = newText);
-                foundExpression = true;
-                break;
-              }
-            }
-            if (!foundExpression) {
-              console.log("📝 Adding new text child");
-              path.node.children.unshift(t.jsxText(newText));
-            }
-          }
-
-          updated = true;
-          path.stop();
+        // Styles
+        if (styles) {
+          upsertStyleAttr(openingEl, styles);
         }
+
+        // Attributes (id, className, alt, etc.)
+        if (attributes) {
+          upsertAttributes(openingEl, attributes);
+        }
+
+        updated = true;
+        path.stop();
       },
     });
-
-    console.log("🔢 Traversal complete:");
-    console.log("  Total JSX elements found:", elementsFound);
-    console.log("  Elements with data-appopen-id:", elementsWithDataId);
-    console.log("  Element updated:", updated);
 
     if (!updated) {
       return res.status(404).json({
         error: "Element not found in AST",
-        debug: {
-          searchingFor: id,
-          parsed,
-          filePath: absPath,
-          totalElements: elementsFound,
-          elementsWithDataId: elementsWithDataId,
-        },
+        debug: { id, absPath },
       });
     }
 
-    console.log("💾 Generating updated code...");
     const output = babelGenerate(ast, { jsescOption: { minimal: true } }, code);
-
-    console.log("📝 Writing file:", absPath);
     fs.writeFileSync(absPath, output.code, "utf8");
 
-    console.log("✅ Update successful!");
-    res.json({ success: true });
+    return res.json({ success: true });
   } catch (err) {
-    console.error("❌ Error occurred:");
-    console.error("  Message:", err && err.message);
-    console.error("  Stack:", err && err.stack);
-    res.status(500).json({ error: err ? String(err) : "unknown error" });
+    console.error("❌ Save error:", err);
+    return res.status(500).json({ error: String(err) });
   }
 });
 
